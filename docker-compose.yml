@@ -1,0 +1,95 @@
+services:
+  zookeeper:
+    image: bitnami/zookeeper:3.9
+    container_name: atividade_oito_zookeeper
+    environment:
+      - ALLOW_ANONYMOUS_LOGIN=yes
+    ports: ["2181:2181"]
+    restart: unless-stopped
+
+  kafka:
+    image: bitnami/kafka:3.7
+    container_name: atividade_oito_kafka
+    depends_on: [zookeeper]
+    environment:
+      - BITNAMI_DEBUG=true
+      - KAFKA_CFG_ZOOKEEPER_CONNECT=zookeeper:2181
+      - KAFKA_ENABLE_KRAFT=no
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,PLAINTEXT_HOST://:9094
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,PLAINTEXT_HOST://127.0.0.1:9094
+      - KAFKA_CFG_INTER_BROKER_LISTENER_NAME=PLAINTEXT
+      - ALLOW_PLAINTEXT_LISTENER=yes
+      - KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=true
+      - KAFKA_CFG_NUM_PARTITIONS=1
+      - KAFKA_CFG_DEFAULT_REPLICATION_FACTOR=1
+    ports: ["9092:9092","9094:9094"]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  # cria o tópico antes do Spark (forma em array para evitar 'exit 127' no Windows)
+  kafka-init:
+    image: bitnami/kafka:3.7
+    container_name: atividade_oito_kafka_init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command:
+      - bash
+      - -lc
+      - |
+        /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
+          --create --if-not-exists --topic reclamacoes --partitions 1 --replication-factor 1 && \
+        /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe --topic reclamacoes
+    restart: "no"
+
+  spark:
+    image: bitnami/spark:3.5
+    container_name: atividade_oito_spark
+    user: root
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      - SPARK_MODE=driver
+      - PYSPARK_PYTHON=python3
+      - PYSPARK_DRIVER_PYTHON=python3
+
+      # === variáveis que o consumer usa ===
+      - BOOTSTRAP=kafka:9092
+      - TOPIC=reclamacoes
+      - OUT_DIR=/home/jovyan/work/data/out/enriched
+      - CKPT_DIR=/home/jovyan/work/data/checkpoints/reclamacoes
+
+      # bancos
+      - BANKS_CSV=/home/jovyan/work/data/EnquadramentoInicia_v2.tsv
+      - BANKS_CSV_SEP=\t
+      - BANKS_CSV_ENCODING=utf-8
+      - BANKS_CNPJ_COL=CNPJ
+      - BANKS_NOME_COL=Nome
+      - BANKS_SEG_COL=Segmento
+
+    working_dir: /home/jovyan/work
+    volumes:
+      - ./data:/home/jovyan/work/data
+      - ./spark_consumer.py:/home/jovyan/work/spark_consumer.py
+      - ./.ivy2:/opt/bitnami/spark/.ivy2   # cache do --packages
+    command:
+      - bash
+      - -lc
+      - |
+        set -e
+        install_packages python3 python3-distutils >/dev/null 2>&1 || true
+        cp /home/jovyan/work/spark_consumer.py /tmp/spark_consumer.py
+        sed -i 's/\r$//' /tmp/spark_consumer.py
+        echo "[INIT] BOOTSTRAP=$BOOTSTRAP | TOPIC=$TOPIC"
+        echo "[INIT] OUT_DIR=$OUT_DIR | CKPT_DIR=$CKPT_DIR"
+        /opt/bitnami/spark/bin/spark-submit \
+          --conf spark.jars.ivy=/opt/bitnami/spark/.ivy2 \
+          --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1 \
+          /tmp/spark_consumer.py
+    restart: unless-stopped
